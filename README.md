@@ -18,7 +18,7 @@ It's designed for web automation and scraping. rod also tries to expose low-leve
 - Automatically find or download [browser](lib/launcher)
 - No external dependencies, [CI](https://github.com/go-rod/rod/actions) tested on Linux, Mac, and Windows
 - High-level helpers like WaitStable, WaitRequestIdle, HijackRequests, GetDownloadFile, etc
-- Two-step WaitEvent design, never miss an event
+- Two-step WaitEvent design, never miss an event ([how it works](https://github.com/ysmood/goob))
 - Correctly handles nested iframes
 - No zombie browser process after the crash ([how it works](https://github.com/ysmood/leakless))
 
@@ -117,6 +117,10 @@ There are a lot of great projects, but no one is perfect, choose the best one th
 
 - [chromedp][chromedp]
 
+  Chromedp uses a [fix-sized buffer](https://github.com/chromedp/chromedp/blob/b56cd66/target.go#L69-L73) for events, it can cause dead-lock on high concurrency. Because of rod don't use fix-sized buffer, rod will use less memory. Because chromedp uses single-event-loop, the slow event handlers will block each other, rod doesn't have this issue. The reason for these is because rod is based on [goob](https://github.com/ysmood/goob).
+
+  Chromedp will JSON decode every message from browser, rod is decode-on-demand, so rod performs better, especially for heavy network events.
+
   For direct code comparison you can check [here](lib/examples/compare-chromedp). If you compare the example called `logic` between [rod](lib/examples/compare-chromedp/logic/main.go) and [chromedp](https://github.com/chromedp/examples/blob/master/logic/main.go), you will find out how much simpler rod is.
 
   With chromedp, you have to use their verbose DSL like tasks to handle the main logic, because chromedp uses several wrappers to handle execution with context and options which makes it very hard to understand their code when bugs happen. The heavily used interfaces also makes the static types useless when tracking issues. In contrast, rod uses classical object model to abstract browser, page, and element.
@@ -131,6 +135,10 @@ There are a lot of great projects, but no one is perfect, choose the best one th
   Rod has a simpler code structure and better test coverage, you should find it's easier to contribute code to rod. Therefore compared with chromedp, rod has the potential to have more nice functions from the community in the future.
 
 - [puppeteer][puppeteer]
+
+  Puppeteer can't guarantee event order, rod guarantees all event order.
+
+  Puppeteer will JSON decode every message from browser, rod is decode-on-demand, so rod performs better, especially for heavy network events.
 
   With puppeteer, you have to handle promise/async/await a lot. End to end tests requires a lot of sync operations to simulate human inputs, because Puppeteer is based on Nodejs all IO operations are async calls, so usually, people end up typing tons of async/await. The overhead grows when your project grows.
 
