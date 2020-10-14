@@ -72,28 +72,6 @@ func (e *Eval) formatToJSFunc() string {
 	return fmt.Sprintf(`function() { return %s }`, e.JS)
 }
 
-// We must pass the jsHelper right before we eval it, or the jsHelper may not be generated yet,
-// we only inject the js helper on the first Page.EvalWithOption .
-func (e *Eval) formatArgs(jsHelper *proto.RuntimeRemoteObject) []*proto.RuntimeCallArgument {
-	var jsArgs []interface{}
-
-	if e.jsHelper {
-		jsArgs = append([]interface{}{jsHelper}, e.JSArgs...)
-	} else {
-		jsArgs = e.JSArgs
-	}
-
-	formated := []*proto.RuntimeCallArgument{}
-	for _, arg := range jsArgs {
-		if obj, ok := arg.(*proto.RuntimeRemoteObject); ok { // remote object
-			formated = append(formated, &proto.RuntimeCallArgument{ObjectID: obj.ObjectID})
-		} else { // plain json data
-			formated = append(formated, &proto.RuntimeCallArgument{Value: gson.New(arg)})
-		}
-	}
-	return formated
-}
-
 // Convert name and jsArgs to Page.Eval, the name is method name in the "lib/assets/helper.js".
 func jsHelper(name js.Name, args ...interface{}) *Eval {
 	return &Eval{
@@ -110,44 +88,51 @@ func (p *Page) Eval(js string, jsArgs ...interface{}) (*proto.RuntimeRemoteObjec
 }
 
 // Evaluate js on the page.
-func (p *Page) Evaluate(opts *Eval) (*proto.RuntimeRemoteObject, error) {
+func (p *Page) Evaluate(opts *Eval) (res *proto.RuntimeRemoteObject, err error) {
 	backoff := utils.BackoffSleeper(30*time.Millisecond, 3*time.Second, nil)
-	this := opts.ThisObj
-	var err error
-	var res *proto.RuntimeCallFunctionOnResult
 
 	// js context will be invalid if a frame is reloaded or not ready, then the isNilContextErr
 	// will be true, then we retry the eval again.
-	err = utils.Retry(p.ctx, backoff, func() (bool, error) {
-		if p.getWindowObj() == nil || opts.ThisObj == nil {
-			err := p.initJS(false)
-			if err != nil {
-				if isNilContextErr(err) {
-					return false, nil
-				}
-				return true, err
-			}
-		}
-		if opts.ThisObj == nil {
-			this = p.getWindowObj()
+	for {
+		p.jsContextIDLock.Lock()
+		wait := p.jsContextIDWait
+		p.jsContextIDLock.Unlock()
+
+		select {
+		case <-p.ctx.Done():
+		case <-wait:
 		}
 
-		res, err = proto.RuntimeCallFunctionOn{
-			ObjectID:            this.ObjectID,
-			AwaitPromise:        true,
-			ReturnByValue:       opts.ByValue,
-			UserGesture:         opts.UserGesture,
-			FunctionDeclaration: opts.formatToJSFunc(),
-			Arguments:           opts.formatArgs(p.getJSHelperObj()),
-		}.Call(p)
-		if opts.ThisObj == nil && isNilContextErr(err) {
-			_ = p.initJS(true)
-			return false, nil
+		res, err = p.evaluate(opts)
+		if isNilContextErr(err) {
+			backoff(p.ctx)
+			continue
 		}
+		return
+	}
+}
 
-		return true, err
-	})
+func (p *Page) evaluate(opts *Eval) (*proto.RuntimeRemoteObject, error) {
+	args, err := p.formatArgs(opts)
+	if err != nil {
+		return nil, err
+	}
 
+	req := proto.RuntimeCallFunctionOn{
+		AwaitPromise:        true,
+		ReturnByValue:       opts.ByValue,
+		UserGesture:         opts.UserGesture,
+		FunctionDeclaration: opts.formatToJSFunc(),
+		Arguments:           args,
+	}
+
+	if opts.ThisObj == nil {
+		req.ExecutionContextID = p.getJSContextID()
+	} else {
+		req.ObjectID = opts.ThisObj.ObjectID
+	}
+
+	res, err := req.Call(p)
 	if err != nil {
 		return nil, err
 	}
@@ -177,85 +162,85 @@ func (p *Page) initSession() error {
 	// even after we re-enable it again we can't query the ids any more.
 	p.EnableDomain(&proto.DOMEnable{})
 
-	return nil
-}
+	p.FrameID = proto.PageFrameID(p.TargetID)
 
-func (p *Page) initJS(force bool) error {
-	contextID, err := p.getExecutionID(force)
-	if err != nil {
-		return err
-	}
+	p.guardJSContext()
 
-	p.jsContextLock.Lock()
-	defer p.jsContextLock.Unlock()
-
-	if !force && p.windowObj != nil {
-		return nil
-	}
-
-	window, err := proto.RuntimeEvaluate{
-		Expression: "window",
-		ContextID:  contextID,
-	}.Call(p)
-	if err != nil {
-		return err
-	}
-
-	helper, err := proto.RuntimeCallFunctionOn{
-		ObjectID:            window.Result.ObjectID,
-		FunctionDeclaration: assets.Helper,
-	}.Call(p)
-	if err != nil {
-		return err
-	}
-
-	p.windowObj = window.Result
-	p.jsHelperObj = helper.Result
+	p.EnableDomain(&proto.RuntimeEnable{})
 
 	return nil
 }
 
-// We use this function to make sure every frame(page, iframe) will only have one IsolatedWorld.
-func (p *Page) getExecutionID(force bool) (proto.RuntimeExecutionContextID, error) {
-	if !p.IsIframe() {
-		return 0, nil
-	}
+func (p *Page) getJSContextID() proto.RuntimeExecutionContextID {
+	p.jsContextIDLock.Lock()
+	defer p.jsContextIDLock.Unlock()
+	return p.jsContextIDs[p.FrameID]
+}
 
-	p.jsContextLock.Lock()
-	defer p.jsContextLock.Unlock()
+// sync RuntimeExecutionContextID with remote
+func (p *Page) guardJSContext() {
+	events := p.Event()
+	go func() {
+		for event := range events {
+			switch e := event.(type) {
+			case *proto.RuntimeExecutionContextCreated:
+				p.jsContextIDLock.Lock()
+				frameID := proto.PageFrameID(e.Context.AuxData["frameId"].Str())
+				p.jsContextIDs[frameID] = e.Context.ID
+				if frameID == p.FrameID {
+					close(p.jsContextIDWait)
+				}
+				p.jsContextIDLock.Unlock()
 
-	if !force {
-		if ctxID, has := p.executionIDs[p.FrameID]; has {
-			_, err := proto.RuntimeEvaluate{ContextID: ctxID, Expression: `0`}.Call(p)
-			if err == nil {
-				return ctxID, nil
-			} else if !isNilContextErr(err) {
-				return 0, err
+			case *proto.PageFrameStartedLoading:
+				p.jsContextIDLock.Lock()
+				if e.FrameID == p.FrameID {
+					p.jsContextIDWait = make(chan struct{})
+				}
+				delete(p.jsContextIDs, e.FrameID)
+				p.jsContextIDLock.Unlock()
 			}
 		}
-	}
-
-	world, err := proto.PageCreateIsolatedWorld{
-		FrameID:   p.FrameID,
-		WorldName: "rod_iframe_world",
-	}.Call(p)
-	if err != nil {
-		return 0, err
-	}
-
-	p.executionIDs[p.FrameID] = world.ExecutionContextID
-
-	return world.ExecutionContextID, nil
+	}()
 }
 
-func (p *Page) getWindowObj() *proto.RuntimeRemoteObject {
-	p.jsContextLock.Lock()
-	defer p.jsContextLock.Unlock()
-	return p.windowObj
+// We must pass the jsHelper right before we eval it, or the jsHelper may not be generated yet,
+// we only inject the js helper on the first Page.EvalWithOption .
+func (p *Page) formatArgs(opts *Eval) ([]*proto.RuntimeCallArgument, error) {
+	var jsArgs []interface{}
+
+	if opts.jsHelper {
+		helper, err := p.getJSHelperObj()
+		if err != nil {
+			return nil, err
+		}
+		jsArgs = append([]interface{}{helper}, opts.JSArgs...)
+	} else {
+		jsArgs = opts.JSArgs
+	}
+
+	formated := []*proto.RuntimeCallArgument{}
+	for _, arg := range jsArgs {
+		if obj, ok := arg.(*proto.RuntimeRemoteObject); ok { // remote object
+			formated = append(formated, &proto.RuntimeCallArgument{ObjectID: obj.ObjectID})
+		} else { // plain json data
+			formated = append(formated, &proto.RuntimeCallArgument{Value: gson.New(arg)})
+		}
+	}
+	return formated, nil
 }
 
-func (p *Page) getJSHelperObj() *proto.RuntimeRemoteObject {
-	p.jsContextLock.Lock()
-	defer p.jsContextLock.Unlock()
-	return p.jsHelperObj
+func (p *Page) getJSHelperObj() (*proto.RuntimeRemoteObject, error) {
+	if p.jsHelperObj == nil {
+		helper, err := proto.RuntimeCallFunctionOn{
+			ExecutionContextID:  p.getJSContextID(),
+			FunctionDeclaration: assets.Helper,
+		}.Call(p)
+		if err != nil {
+			return nil, err
+		}
+		p.jsHelperObj = helper.Result
+	}
+
+	return p.jsHelperObj, nil
 }

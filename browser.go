@@ -173,7 +173,9 @@ func (b *Browser) Close() error {
 func (b *Browser) Page(opts proto.TargetCreateTarget) (p *Page, err error) {
 	req := opts
 	req.BrowserContextID = b.BrowserContextID
-	req.URL = "about:blank"
+	if opts.URL == "" {
+		req.URL = "about:blank"
+	}
 
 	target, err := req.Call(b)
 	if err != nil {
@@ -187,9 +189,6 @@ func (b *Browser) Page(opts proto.TargetCreateTarget) (p *Page, err error) {
 	}()
 
 	p, err = b.PageFromTarget(target.TargetID)
-	if err == nil && opts.URL != "" { // no need to navigate if url is empty
-		err = p.Navigate(opts.URL)
-	}
 
 	return
 }
@@ -228,22 +227,23 @@ func (b *Browser) Call(ctx context.Context, sessionID, methodName string, params
 	return
 }
 
-// PageFromTarget creates a Page instance from a targetID
+// PageFromTarget gets or creates a Page instance.
 func (b *Browser) PageFromTarget(targetID proto.TargetTargetID) (*Page, error) {
 	b.targetsLock.Lock()
 	defer b.targetsLock.Unlock()
 
-	page := b.loadPage(targetID)
+	page := b.loadCachedPage(targetID)
 	if page != nil {
 		return page, nil
 	}
 
 	page = (&Page{
-		sleeper:       b.sleeper,
-		jsContextLock: &sync.Mutex{},
-		browser:       b,
-		TargetID:      targetID,
-		executionIDs:  map[proto.PageFrameID]proto.RuntimeExecutionContextID{},
+		sleeper:         b.sleeper,
+		jsContextIDLock: &sync.Mutex{},
+		browser:         b,
+		TargetID:        targetID,
+		jsContextIDs:    map[proto.PageFrameID]proto.RuntimeExecutionContextID{},
+		jsContextIDWait: make(chan struct{}),
 	}).Context(b.ctx)
 
 	page.Mouse = &Mouse{page: page, id: utils.RandString(8)}
@@ -262,7 +262,7 @@ func (b *Browser) PageFromTarget(targetID proto.TargetTargetID) (*Page, error) {
 		}
 	}
 
-	b.storePage(page)
+	b.cachePage(page)
 
 	return page, nil
 }
@@ -311,16 +311,16 @@ func (b *Browser) eachEvent(sessionID proto.TargetSessionID, callbacks ...interf
 	messages := b.Context(ctx).Event()
 
 	return func() {
+		if ctx.Err() != nil {
+			panic("can't use wait function twice")
+		}
+
 		defer func() {
 			cancel()
 			for _, restore := range restores {
 				restore()
 			}
 		}()
-
-		if ctx.Err() != nil {
-			panic("can't use wait function twice")
-		}
 
 		for msg := range messages {
 			if !(sessionID == "" || msg.SessionID == sessionID) {

@@ -24,6 +24,7 @@ var _ proto.Sessionable = &Page{}
 // Page represents the webpage
 // We try to hold as less states as possible
 type Page struct {
+
 	// these are the handler for ctx
 	ctx     context.Context
 	sleeper func() utils.Sleeper
@@ -39,11 +40,12 @@ type Page struct {
 	Keyboard *Keyboard
 	Touch    *Touch
 
-	element       *Element                   // iframe only
-	windowObj     *proto.RuntimeRemoteObject // used as the thisObject when eval js
-	jsHelperObj   *proto.RuntimeRemoteObject
-	executionIDs  map[proto.PageFrameID]proto.RuntimeExecutionContextID
-	jsContextLock *sync.Mutex
+	element *Element // iframe only
+
+	jsContextIDLock *sync.Mutex
+	jsContextIDWait chan struct{}
+	jsContextIDs    map[proto.PageFrameID]proto.RuntimeExecutionContextID
+	jsHelperObj     *proto.RuntimeRemoteObject
 }
 
 // IsIframe tells if it's iframe
@@ -127,11 +129,6 @@ func (p *Page) Navigate(url string) error {
 		url = "about:blank"
 	}
 
-	err := p.StopLoading()
-	if err != nil {
-		return err
-	}
-
 	res, err := proto.PageNavigate{URL: url}.Call(p)
 	if err != nil {
 		return err
@@ -139,8 +136,6 @@ func (p *Page) Navigate(url string) error {
 	if res.ErrorText != "" {
 		return &ErrNavigation{res.ErrorText}
 	}
-
-	p.FrameID = res.FrameID
 
 	return nil
 }
@@ -670,14 +665,9 @@ func (p *Page) enableNodeQuery() {
 }
 
 func (p *Page) resolveNode(nodeID proto.DOMNodeID) (*proto.RuntimeRemoteObject, error) {
-	ctxID, err := p.getExecutionID(false)
-	if err != nil {
-		return nil, err
-	}
-
 	node, err := proto.DOMResolveNode{
 		NodeID:             nodeID,
-		ExecutionContextID: ctxID,
+		ExecutionContextID: p.getJSContextID(),
 	}.Call(p)
 	if err != nil {
 		return nil, err

@@ -83,11 +83,11 @@ func (b *Browser) DisableDomain(sessionID proto.TargetSessionID, req proto.Reque
 	}
 }
 
-func (b *Browser) storePage(page *Page) {
+func (b *Browser) cachePage(page *Page) {
 	b.states.Store(page.TargetID, page)
 }
 
-func (b *Browser) loadPage(id proto.TargetTargetID) *Page {
+func (b *Browser) loadCachedPage(id proto.TargetTargetID) *Page {
 	if cache, ok := b.states.Load(id); ok {
 		return cache.(*Page)
 	}

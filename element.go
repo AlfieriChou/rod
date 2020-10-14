@@ -359,7 +359,6 @@ func (el *Element) Frame() (*Page, error) {
 	newPage.FrameID = node.FrameID
 	newPage.element = el
 	newPage.jsHelperObj = nil
-	newPage.windowObj = nil
 	return &newPage, nil
 }
 

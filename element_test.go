@@ -160,36 +160,6 @@ func (t T) Iframes() {
 	el := frame.MustElement("button")
 	el.MustClick()
 	t.True(frame.MustHas("[a=ok]"))
-
-	id := el.MustNodeID()
-	t.Panic(func() {
-		t.mc.stubErr(1, proto.RuntimeCallFunctionOn{})
-		p.MustElementFromNode(id)
-	})
-
-	t.Panic(func() {
-		t.mc.stub(1, proto.RuntimeGetProperties{}, func(send StubSend) (gson.JSON, error) {
-			d, _ := send()
-			return *d.Set("result", []interface{}{}), nil
-		})
-		p.MustElementFromNode(id).MustText()
-	})
-	t.Panic(func() {
-		t.mc.stubErr(1, proto.DOMDescribeNode{})
-		p.MustElementFromNode(id)
-	})
-	t.Panic(func() {
-		t.mc.stubErr(1, proto.RuntimeEvaluate{})
-		p.MustElementFromNode(id)
-	})
-	t.Panic(func() {
-		t.mc.stubErr(4, proto.RuntimeCallFunctionOn{})
-		p.MustElementFromNode(id)
-	})
-	t.Panic(func() {
-		t.mc.stubErr(4, proto.RuntimeEvaluate{})
-		p.MustElementFromNode(id)
-	})
 }
 
 func (t T) Contains() {
